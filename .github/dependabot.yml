@@ -1,0 +1,55 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: saturday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: weekly
+      day: saturday
+      time: "09:15"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: saturday
+      time: "09:25"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: docker
+    directory: /backend
+    schedule:
+      interval: weekly
+      day: saturday
+      time: "09:30"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: docker
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: saturday
+      time: "09:45"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: saturday
+      time: "10:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5

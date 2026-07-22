@@ -1,0 +1,12 @@
+{
+  "name": "Beta-Demo777 Portfolio",
+  "short_name": "Beta-Demo777",
+  "description": "Beta-Demo777 的个人作品集、技术博客与 AI 应用项目展示。",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#050507",
+  "theme_color": "#050507",
+  "lang": "zh-CN"
+}

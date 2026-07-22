@@ -1,0 +1,6 @@
+{
+  "name": "Minimalist Blog & Portfolio",
+  "description": "A highly interactive, modern, and minimalist developer portfolio and blog interface featuring advanced frontend motion animations, dynamic canvas particle effects, and rich typography.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
