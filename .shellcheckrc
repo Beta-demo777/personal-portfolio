@@ -1,0 +1,4 @@
+# Single-quoted command strings are intentionally expanded by the target
+# container's shell rather than by the host shell that invokes Docker.
+disable=SC2016
+source-path=SCRIPTDIR

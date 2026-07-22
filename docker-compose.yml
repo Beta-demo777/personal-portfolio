@@ -1,0 +1,398 @@
+name: portfolio
+
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  secret-init:
+    image: alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+    entrypoint: ["/bin/sh", "-euc"]
+    command:
+      - |
+        fail() {
+          printf 'secret-init: %s\n' "$$1" >&2
+          exit 1
+        }
+        validate_secret() {
+          source=$$1
+          label=$$2
+          required=$$3
+          test -f "$$source" || fail "$$label source is unavailable"
+          size=$$(wc -c < "$$source")
+          test "$$size" -le 16384 || fail "$$label exceeds 16 KiB"
+          if test "$$required" = required; then
+            grep -q '[^[:space:]]' "$$source" || fail "$$label must not be empty"
+          fi
+        }
+        stage_secret() {
+          source=$$1
+          target=$$2
+          cp "$$source" "$${target}.tmp"
+          chmod 0444 "$${target}.tmp"
+        }
+        commit_secret() {
+          target=$$1
+          mv -f "$${target}.tmp" "$$target"
+        }
+        cleanup_temporary_files() {
+          rm -f \
+            /runtime/postgres/postgres_password.tmp \
+            /runtime/database-init/postgres_password.tmp \
+            /runtime/database-init/postgres_app_password.tmp \
+            /runtime/backend/postgres_app_password.tmp \
+            /runtime/backend/blog_admin_password_hash.tmp \
+            /runtime/backend/app_secret_key.tmp \
+            /runtime/frontend/ai_api_key.tmp
+        }
+
+        umask 077
+        cleanup_temporary_files
+        trap cleanup_temporary_files EXIT HUP INT TERM
+
+        validate_secret /run/secrets/postgres_password POSTGRES_PASSWORD required
+        validate_secret /run/secrets/postgres_app_password POSTGRES_APP_PASSWORD required
+        validate_secret /run/secrets/blog_admin_password_hash BLOG_ADMIN_PASSWORD_HASH required
+        grep -Eq '^[$$]argon2id[$$]v=19[$$]' /run/secrets/blog_admin_password_hash || \
+          fail 'BLOG_ADMIN_PASSWORD_HASH must be an Argon2id v=19 hash'
+        validate_secret /run/secrets/app_secret_key APP_SECRET_KEY required
+        validate_secret /run/secrets/ai_api_key AI_API_KEY optional
+
+        stage_secret /run/secrets/postgres_password /runtime/postgres/postgres_password
+        stage_secret /run/secrets/postgres_password /runtime/database-init/postgres_password
+        stage_secret /run/secrets/postgres_app_password /runtime/database-init/postgres_app_password
+        stage_secret /run/secrets/postgres_app_password /runtime/backend/postgres_app_password
+        stage_secret /run/secrets/blog_admin_password_hash /runtime/backend/blog_admin_password_hash
+        stage_secret /run/secrets/app_secret_key /runtime/backend/app_secret_key
+        stage_secret /run/secrets/ai_api_key /runtime/frontend/ai_api_key
+
+        # Remove credentials left by deployments that used the legacy plaintext password.
+        rm -f \
+          /runtime/backend/postgres_password \
+          /runtime/backend/postgres_password.tmp \
+          /runtime/backend/blog_admin_password \
+          /runtime/backend/blog_admin_password.tmp
+        commit_secret /runtime/postgres/postgres_password
+        commit_secret /runtime/database-init/postgres_password
+        commit_secret /runtime/database-init/postgres_app_password
+        commit_secret /runtime/backend/postgres_app_password
+        commit_secret /runtime/backend/blog_admin_password_hash
+        commit_secret /runtime/backend/app_secret_key
+        commit_secret /runtime/frontend/ai_api_key
+        # The frontend secret volume is dedicated to this single credential.
+        # Remove stale files left by earlier naming conventions only after the
+        # new credential has been committed successfully.
+        for retired_secret in /runtime/frontend/*; do
+          test "$$retired_secret" = /runtime/frontend/ai_api_key || rm -f -- "$$retired_secret"
+        done
+        trap - EXIT HUP INT TERM
+    secrets:
+      - postgres_password
+      - postgres_app_password
+      - blog_admin_password_hash
+      - app_secret_key
+      - ai_api_key
+    volumes:
+      - portfolio_postgres_secrets:/runtime/postgres
+      - portfolio_database_init_secrets:/runtime/database-init
+      - portfolio_backend_secrets:/runtime/backend
+      - portfolio_frontend_secrets:/runtime/frontend
+    network_mode: none
+    read_only: true
+    # File-backed Compose secrets retain their host ownership. The initializer
+    # needs only read/search bypass to consume deployment-user-owned 0600 files.
+    cap_add:
+      - DAC_READ_SEARCH
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 32
+    mem_limit: 32m
+    cpus: 0.25
+    logging: *default-logging
+    restart: "no"
+
+  postgres:
+    image: postgres:16@sha256:17e67d7b9890c99b055ba1e0d5c5be4ec27c9d3a72bda32db24a5e5d8a85af0c
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set and non-empty}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set and non-empty}
+    depends_on:
+      secret-init:
+        condition: service_completed_successfully
+    volumes:
+      - portfolio_postgres_data:/var/lib/postgresql/data
+      - portfolio_postgres_secrets:/run/secrets:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+      - /var/run/postgresql:rw,noexec,nosuid,size=8m,mode=3775
+    networks:
+      - db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:?POSTGRES_USER must be set and non-empty} -d ${POSTGRES_DB:?POSTGRES_DB must be set and non-empty}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *default-logging
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: 1.0
+    pids_limit: 200
+    shm_size: 128m
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  database-init:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["database-init"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set and non-empty}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_RUNTIME_USER: ${POSTGRES_APP_USER:-portfolio_app}
+      POSTGRES_RUNTIME_PASSWORD_FILE: /run/secrets/postgres_app_password
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set and non-empty}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      DB_CONNECT_TIMEOUT_SECONDS: ${DB_CONNECT_TIMEOUT_SECONDS:-3}
+      DB_POOL_TIMEOUT_SECONDS: ${DB_POOL_TIMEOUT_SECONDS:-3}
+      DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-4000}
+      DB_MIGRATION_STATEMENT_TIMEOUT_MS: ${DB_MIGRATION_STATEMENT_TIMEOUT_MS:-120000}
+      ADMIN_ENABLED: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - portfolio_database_init_secrets:/run/secrets:ro
+    networks:
+      - db
+    logging: *default-logging
+    mem_limit: 256m
+    mem_reservation: 64m
+    cpus: 0.5
+    pids_limit: 64
+    restart: "no"
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      POSTGRES_USER: ${POSTGRES_APP_USER:-portfolio_app}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_app_password
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set and non-empty}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      DB_CONNECT_TIMEOUT_SECONDS: ${DB_CONNECT_TIMEOUT_SECONDS:-3}
+      DB_POOL_TIMEOUT_SECONDS: ${DB_POOL_TIMEOUT_SECONDS:-3}
+      DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-4000}
+      DB_MIGRATION_STATEMENT_TIMEOUT_MS: ${DB_MIGRATION_STATEMENT_TIMEOUT_MS:-120000}
+      API_DOCS_ENABLED: ${API_DOCS_ENABLED:-false}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-beta-demo.top,localhost,127.0.0.1,backend}
+      ADMIN_WRITES_ENABLED: ${ADMIN_WRITES_ENABLED:-true}
+      BLOG_ADMIN_PASSWORD_HASH_FILE: /run/secrets/blog_admin_password_hash
+      APP_SECRET_KEY_FILE: /run/secrets/app_secret_key
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-true}
+      AUTH_SESSION_HOURS: ${AUTH_SESSION_HOURS:-12}
+      ADMIN_LOGIN_MAX_FAILURES: ${ADMIN_LOGIN_MAX_FAILURES:-5}
+      ADMIN_LOGIN_WINDOW_SECONDS: ${ADMIN_LOGIN_WINDOW_SECONDS:-900}
+      ADMIN_LOGIN_LOCKOUT_SECONDS: ${ADMIN_LOGIN_LOCKOUT_SECONDS:-900}
+      ADMIN_LOGIN_MAX_CLIENTS: ${ADMIN_LOGIN_MAX_CLIENTS:-10000}
+      AUTH_TRUSTED_PROXY_CIDRS: ${AUTH_TRUSTED_PROXY_CIDRS:-127.0.0.0/8,::1/128,172.16.0.0/12}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-https://beta-demo.top}
+      CSRF_TRUSTED_ORIGINS: ${CSRF_TRUSTED_ORIGINS:-}
+      UPLOAD_DIR: /app/uploads
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-8}
+      MAX_MEDIA_FILES: ${MAX_MEDIA_FILES:-1000}
+      MAX_CONCURRENT_UPLOADS: ${MAX_CONCURRENT_UPLOADS:-2}
+      MAX_IMAGE_PIXELS: ${MAX_IMAGE_PIXELS:-40000000}
+      MAX_IMAGE_DIMENSION: ${MAX_IMAGE_DIMENSION:-12000}
+      MAX_IMAGE_FRAMES: ${MAX_IMAGE_FRAMES:-200}
+      MAX_IMAGE_TOTAL_PIXELS: ${MAX_IMAGE_TOTAL_PIXELS:-80000000}
+      MAX_CONTENT_BYTES: ${MAX_CONTENT_BYTES:-2097152}
+      MAX_CONTENT_REVISIONS: ${MAX_CONTENT_REVISIONS:-100}
+    depends_on:
+      database-init:
+        condition: service_completed_successfully
+    expose:
+      - "8000"
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - portfolio_uploads:/app/uploads
+      - portfolio_backend_secrets:/run/secrets:ro
+    networks:
+      - app
+      - db
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
+    mem_limit: 768m
+    mem_reservation: 128m
+    cpus: 1.5
+    pids_limit: 256
+    stop_grace_period: 20s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      AI_API_KEY_FILE: /run/secrets/ai_api_key
+      AI_MODEL: ${AI_MODEL:-deepseek-v4-flash}
+      NODE_ENV: production
+      PORT: 3000
+      SHUTDOWN_TIMEOUT_MS: ${SHUTDOWN_TIMEOUT_MS:-18000}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-https://beta-demo.top}
+      CMS_INTERNAL_ORIGIN: http://backend:8000
+      CMS_FETCH_TIMEOUT_MS: ${CMS_FETCH_TIMEOUT_MS:-3000}
+      CMS_CONTENT_LIMIT_BYTES: ${CMS_CONTENT_LIMIT_BYTES:-3145728}
+      CMS_CACHE_TTL_MS: ${CMS_CACHE_TTL_MS:-30000}
+      CMS_STALE_TTL_MS: ${CMS_STALE_TTL_MS:-300000}
+      TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-1}
+      AGENT_MAX_BODY_BYTES: ${AGENT_MAX_BODY_BYTES:-65536}
+      AGENT_MAX_MESSAGES: ${AGENT_MAX_MESSAGES:-12}
+      AGENT_MAX_MESSAGE_CHARS: ${AGENT_MAX_MESSAGE_CHARS:-4000}
+      AGENT_MAX_USER_MESSAGE_CHARS: ${AGENT_MAX_USER_MESSAGE_CHARS:-1500}
+      AGENT_MAX_HISTORY_CHARS: ${AGENT_MAX_HISTORY_CHARS:-12000}
+      AGENT_MAX_OUTPUT_TOKENS: ${AGENT_MAX_OUTPUT_TOKENS:-512}
+      AGENT_UPSTREAM_TIMEOUT_MS: ${AGENT_UPSTREAM_TIMEOUT_MS:-15000}
+      AGENT_MAX_CONCURRENT_REQUESTS: ${AGENT_MAX_CONCURRENT_REQUESTS:-2}
+      AGENT_RATE_WINDOW_MS: ${AGENT_RATE_WINDOW_MS:-60000}
+      AGENT_RATE_REQUESTS: ${AGENT_RATE_REQUESTS:-6}
+      AGENT_DAILY_REQUESTS_PER_IP: ${AGENT_DAILY_REQUESTS_PER_IP:-40}
+      AGENT_GLOBAL_DAILY_REQUESTS: ${AGENT_GLOBAL_DAILY_REQUESTS:-500}
+      AGENT_MAX_TRACKED_IPS: ${AGENT_MAX_TRACKED_IPS:-10000}
+    depends_on:
+      secret-init:
+        condition: service_completed_successfully
+    expose:
+      - "3000"
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - portfolio_frontend_secrets:/run/secrets:ro
+    networks:
+      - edge
+      - app
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging: *default-logging
+    mem_limit: 384m
+    mem_reservation: 64m
+    cpus: 1.0
+    pids_limit: 128
+    stop_grace_period: 20s
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.28-alpine@sha256:a8b39bd9cf0f83869a2162827a0caf6137ddf759d50a171451b335cecc87d236
+    environment:
+      NGINX_HEALTH_CA_FILE: ${NGINX_HEALTH_CA_FILE:-}
+    depends_on:
+      frontend:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    init: true
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:rw,noexec,nosuid,size=16m
+      - /var/run:rw,noexec,nosuid,size=1m
+      - /tmp:rw,noexec,nosuid,size=8m
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - edge
+      - app
+      - showcase
+    extra_hosts:
+      - "beta-demo.top:127.0.0.1"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - |
+          nginx -t >/dev/null 2>&1 || exit 1
+          if [ -n "$${NGINX_HEALTH_CA_FILE:-}" ]; then
+            test -r "$$NGINX_HEALTH_CA_FILE" || exit 1
+            exec curl --fail --silent --show-error --connect-timeout 1 --max-time 3 --noproxy '*' --cacert "$$NGINX_HEALTH_CA_FILE" https://beta-demo.top/healthz --output /dev/null
+          fi
+          exec curl --fail --silent --show-error --connect-timeout 1 --max-time 3 --noproxy '*' https://beta-demo.top/healthz --output /dev/null
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
+    mem_limit: 128m
+    mem_reservation: 32m
+    cpus: 0.5
+    pids_limit: 64
+    stop_grace_period: 20s
+    restart: unless-stopped
+
+networks:
+  edge:
+  app:
+    internal: true
+  db:
+    internal: true
+  showcase:
+    name: portfolio-showcase
+
+volumes:
+  portfolio_postgres_data:
+  portfolio_uploads:
+  portfolio_postgres_secrets:
+  portfolio_database_init_secrets:
+  portfolio_backend_secrets:
+  portfolio_frontend_secrets:
+
+secrets:
+  postgres_password:
+    file: ${PORTFOLIO_POSTGRES_PASSWORD_SECRET_FILE:?PORTFOLIO_POSTGRES_PASSWORD_SECRET_FILE must point to a readable host secret file}
+  postgres_app_password:
+    file: ${PORTFOLIO_POSTGRES_APP_PASSWORD_SECRET_FILE:?PORTFOLIO_POSTGRES_APP_PASSWORD_SECRET_FILE must point to a readable host secret file}
+  blog_admin_password_hash:
+    file: ${PORTFOLIO_ADMIN_PASSWORD_HASH_SECRET_FILE:?PORTFOLIO_ADMIN_PASSWORD_HASH_SECRET_FILE must point to a readable host secret file}
+  app_secret_key:
+    file: ${PORTFOLIO_APP_SECRET_KEY_SECRET_FILE:?PORTFOLIO_APP_SECRET_KEY_SECRET_FILE must point to a readable host secret file}
+  ai_api_key:
+    file: ${PORTFOLIO_AI_API_KEY_SECRET_FILE:?PORTFOLIO_AI_API_KEY_SECRET_FILE must point to a readable host secret file}

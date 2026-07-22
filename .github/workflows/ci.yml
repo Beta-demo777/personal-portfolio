@@ -1,0 +1,711 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Repository security and shell quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Scan Git history for secrets
+        run: python3 scripts/scan_secrets.py --history
+      - name: Scan tracked files for high-confidence secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          matches_file="${RUNNER_TEMP}/secret-files.txt"
+          patterns='-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|gh[pousr]_[0-9A-Za-z]{36,255}|github_pat_[0-9A-Za-z_]{80,255}|xox[baprs]-[0-9A-Za-z-]{20,}'
+          if git grep -I -l -E -e "${patterns}" -- . ':(exclude).github/workflows/ci.yml' > "${matches_file}"; then
+            echo "High-confidence secret material found in tracked files:" >&2
+            sed 's/^/  /' "${matches_file}" >&2
+            exit 1
+          fi
+      - name: Install ShellCheck
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends --yes shellcheck
+          fi
+      - name: Check shell scripts
+        run: shellcheck scripts/*.sh scripts/tests/*.sh backend/docker-entrypoint.sh
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22.23.1"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Type-check
+        run: npm run lint
+      - name: Run frontend tests
+        run: npm test
+      - name: Build
+        run: npm run build
+
+  browser:
+    name: Browser UX and accessibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22.23.1"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Run browser quality gate
+        run: npm run test:e2e
+      - name: Upload browser failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: playwright-failure-${{ github.run_id }}
+          path: |
+            frontend/playwright-report
+            frontend/test-results
+          if-no-files-found: warn
+          retention-days: 7
+
+  backend:
+    name: Backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: backend
+      POSTGRES_USER: ci_user
+      POSTGRES_PASSWORD: ci_password
+      POSTGRES_DB: ci_portfolio
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: 5432
+      APP_SECRET_KEY: ci_only_session_key_at_least_32_bytes
+      AUTH_COOKIE_SECURE: "false"
+      PORTFOLIO_DISABLE_DOTENV: "true"
+    services:
+      postgres:
+        image: postgres:16@sha256:17e67d7b9890c99b055ba1e0d5c5be4ec27c9d3a72bda32db24a5e5d8a85af0c
+        env:
+          POSTGRES_USER: ci_user
+          POSTGRES_PASSWORD: ci_password
+          POSTGRES_DB: ci_portfolio
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci_user -d ci_portfolio"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12.13"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+            backend/requirements.lock
+            backend/requirements-dev.lock
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r backend/requirements-dev.lock
+      - name: Verify Python dependency locks
+        shell: bash
+        run: |
+          set -euo pipefail
+          CUSTOM_COMPILE_COMMAND='python -m piptools compile --generate-hashes --no-annotate --strip-extras --no-emit-index-url --no-emit-trusted-host --output-file=backend/requirements.lock backend/requirements.txt' \
+            python -m piptools compile --quiet --generate-hashes --no-annotate --strip-extras \
+              --no-emit-index-url --no-emit-trusted-host \
+              --output-file=backend/requirements.lock backend/requirements.txt
+          CUSTOM_COMPILE_COMMAND='python -m piptools compile --allow-unsafe --generate-hashes --no-annotate --strip-extras --no-emit-index-url --no-emit-trusted-host --output-file=backend/requirements-dev.lock backend/requirements-dev.txt' \
+            python -m piptools compile --quiet --allow-unsafe --generate-hashes --no-annotate --strip-extras \
+              --no-emit-index-url --no-emit-trusted-host \
+              --output-file=backend/requirements-dev.lock backend/requirements-dev.txt
+          git diff --exit-code -- backend/requirements.lock backend/requirements-dev.lock
+      - name: Create hashed administrator test credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          admin_password="$(openssl rand -hex 24)"
+          echo "::add-mask::${admin_password}"
+          admin_password_hash="$(
+            printf '%s' "${admin_password}" |
+              python -c 'import sys; from argon2 import PasswordHasher; from argon2.low_level import Type; print(PasswordHasher(type=Type.ID).hash(sys.stdin.read()))'
+          )"
+          echo "::add-mask::${admin_password_hash}"
+          if [[ "${admin_password_hash}" != '$argon2id$v=19$'* ]]; then
+            echo "Failed to generate an Argon2id v=19 administrator password hash" >&2
+            exit 1
+          fi
+          password_file="${RUNNER_TEMP}/portfolio-test-admin-password"
+          umask 077
+          printf '%s' "${admin_password}" > "${password_file}"
+          {
+            echo "BLOG_ADMIN_PASSWORD_HASH=${admin_password_hash}"
+            echo "PORTFOLIO_TEST_ADMIN_PASSWORD_FILE=${password_file}"
+          } >> "${GITHUB_ENV}"
+      - name: Compile Python sources
+        run: python -m compileall -q backend/app backend/test_support.py backend/tests backend/integration_tests backend/alembic
+      - name: Run unit tests
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 scripts/tests/run.sh
+          python -m unittest discover -s backend/tests -v
+          python -m unittest discover -s backend/alembic/tests -v
+      - name: Render migration SQL offline
+        run: |
+          python -m alembic -c alembic.ini upgrade head --sql > "${RUNNER_TEMP}/migration.sql"
+          test -s "${RUNNER_TEMP}/migration.sql"
+          if grep -Fq "${POSTGRES_PASSWORD}" "${RUNNER_TEMP}/migration.sql"; then
+            echo "Migration SQL unexpectedly contains the database password" >&2
+            exit 1
+          fi
+      - name: Apply migration to PostgreSQL 16
+        run: python -m alembic -c alembic.ini upgrade head
+      - name: Verify online migration revision
+        run: |
+          python - <<'PY'
+          from alembic.config import Config
+          from alembic.migration import MigrationContext
+          from alembic.script import ScriptDirectory
+
+          from app.db.session import engine
+
+          repository_heads = tuple(
+              ScriptDirectory.from_config(Config("alembic.ini")).get_heads()
+          )
+          if len(repository_heads) != 1:
+              raise SystemExit(
+                  "Expected exactly one repository Alembic head; "
+                  f"found {repository_heads!r}"
+              )
+          with engine.connect() as connection:
+              database_heads = tuple(
+                  MigrationContext.configure(connection).get_current_heads()
+              )
+          if database_heads != repository_heads:
+              raise SystemExit(
+                  "Database Alembic revision does not match the repository head: "
+                  f"database={database_heads!r}, repository={repository_heads!r}"
+              )
+          print(f"Verified Alembic revision {repository_heads[0]}")
+          PY
+      - name: Run ASGI and PostgreSQL integration test
+        env:
+          PORTFOLIO_RUN_DB_INTEGRATION: "true"
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "${PORTFOLIO_TEST_ADMIN_PASSWORD_FILE}"
+          admin_password="$(< "${PORTFOLIO_TEST_ADMIN_PASSWORD_FILE}")"
+          rm -f "${PORTFOLIO_TEST_ADMIN_PASSWORD_FILE}"
+          PORTFOLIO_TEST_ADMIN_PASSWORD="${admin_password}" \
+            python -m unittest discover -s backend/integration_tests -v
+      - name: Remove temporary administrator test credential
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${PORTFOLIO_TEST_ADMIN_PASSWORD_FILE:-}" ]]; then
+            rm -f -- "${PORTFOLIO_TEST_ADMIN_PASSWORD_FILE}"
+          fi
+
+  supply-chain:
+    name: Supply chain (${{ matrix.component }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [quality, frontend, backend]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: backend
+            context: .
+            dockerfile: backend/Dockerfile
+          - component: frontend
+            context: frontend
+            dockerfile: frontend/Dockerfile
+    env:
+      DOCKER_BUILDKIT: "1"
+      IMAGE_REF: portfolio-${{ matrix.component }}:ci-${{ github.sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Build tagged final image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build \
+            --file "${{ matrix.dockerfile }}" \
+            --tag "${IMAGE_REF}" \
+            "${{ matrix.context }}"
+          test "$(docker image inspect --format '{{.Id}}' "${IMAGE_REF}")" != ""
+          mkdir -p supply-chain-reports
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ env.IMAGE_REF }}
+          format: cyclonedx-json
+          output-file: supply-chain-reports/${{ matrix.component }}.cyclonedx.json
+          syft-version: v1.48.0
+          dependency-snapshot: false
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ env.IMAGE_REF }}
+          format: spdx-json
+          output-file: supply-chain-reports/${{ matrix.component }}.spdx.json
+          syft-version: v1.48.0
+          dependency-snapshot: false
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Scan fixable high and critical vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_REF }}
+          version: v0.70.0
+          scanners: vuln
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: json
+          output: supply-chain-reports/${{ matrix.component }}.trivy.json
+          exit-code: "1"
+          timeout: 10m0s
+      - name: Upload supply-chain reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: supply-chain-${{ matrix.component }}-${{ github.run_id }}
+          path: supply-chain-reports
+          if-no-files-found: error
+          retention-days: 30
+
+  compose:
+    name: Compose deployment and recovery integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [quality, frontend, browser, backend, supply-chain]
+    env:
+      POSTGRES_USER: ci_user
+      POSTGRES_APP_USER: ci_app
+      POSTGRES_DB: ci_portfolio
+      AUTH_COOKIE_SECURE: "true"
+      PUBLIC_ORIGIN: https://beta-demo.top
+      NGINX_HEALTH_CA_FILE: /etc/nginx/certs/ci-health-ca.pem
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Require Docker Compose 2.30 or newer
+        shell: bash
+        run: |
+          set -euo pipefail
+          installed="$(docker compose version --short)"
+          python3 - "${installed}" <<'PY'
+          import re
+          import sys
+
+          match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", sys.argv[1])
+          if match is None or tuple(map(int, match.groups())) < (2, 30, 0):
+              raise SystemExit(f"Docker Compose 2.30.0+ is required; found {sys.argv[1]}")
+          PY
+      - name: Set up Python for credential hashing
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12.13"
+          cache: pip
+          cache-dependency-path: backend/requirements.lock
+      - name: Install credential hashing dependency
+        run: python -m pip install --disable-pip-version-check --require-hashes -r backend/requirements.lock
+      - name: Create isolated CI secrets and TLS certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          secrets_dir="${RUNNER_TEMP}/portfolio-compose-secrets"
+          install -d -m 0700 "${secrets_dir}"
+          postgres_password_file="${secrets_dir}/postgres_password"
+          postgres_app_password_file="${secrets_dir}/postgres_app_password"
+          admin_password_file="${secrets_dir}/admin_password"
+          admin_password_hash_file="${secrets_dir}/blog_admin_password_hash"
+          app_secret_key_file="${secrets_dir}/app_secret_key"
+          ai_api_key_file="${secrets_dir}/ai_api_key"
+          umask 077
+          openssl rand -hex 32 > "${postgres_password_file}"
+          openssl rand -hex 32 > "${postgres_app_password_file}"
+          openssl rand -hex 32 > "${app_secret_key_file}"
+          : > "${ai_api_key_file}"
+
+          admin_password="$(openssl rand -hex 24)"
+          echo "::add-mask::${admin_password}"
+          printf '%s' "${admin_password}" > "${admin_password_file}"
+          python -c 'import sys; from argon2 import PasswordHasher; from argon2.low_level import Type; print(PasswordHasher(type=Type.ID).hash(sys.stdin.read()))' \
+            < "${admin_password_file}" \
+            > "${admin_password_hash_file}"
+          unset admin_password
+          grep -q '^[$]argon2id[$]v=19[$]' "${admin_password_hash_file}"
+
+          chmod 0600 \
+            "${postgres_password_file}" \
+            "${postgres_app_password_file}" \
+            "${admin_password_file}" \
+            "${admin_password_hash_file}" \
+            "${app_secret_key_file}" \
+            "${ai_api_key_file}"
+          for secret_file in \
+            "${postgres_password_file}" \
+            "${postgres_app_password_file}" \
+            "${admin_password_file}" \
+            "${admin_password_hash_file}" \
+            "${app_secret_key_file}" \
+            "${ai_api_key_file}"; do
+            test -f "${secret_file}"
+            test "$(stat -c '%a' "${secret_file}")" = "600"
+          done
+
+          {
+            echo "PORTFOLIO_POSTGRES_PASSWORD_SECRET_FILE=${postgres_password_file}"
+            echo "PORTFOLIO_POSTGRES_APP_PASSWORD_SECRET_FILE=${postgres_app_password_file}"
+            echo "PORTFOLIO_ADMIN_PASSWORD_FILE=${admin_password_file}"
+            echo "PORTFOLIO_ADMIN_PASSWORD_HASH_SECRET_FILE=${admin_password_hash_file}"
+            echo "PORTFOLIO_APP_SECRET_KEY_SECRET_FILE=${app_secret_key_file}"
+            echo "PORTFOLIO_AI_API_KEY_SECRET_FILE=${ai_api_key_file}"
+          } >> "${GITHUB_ENV}"
+
+          install -d nginx/certs
+          openssl req -x509 -newkey rsa:2048 -nodes -days 90 -sha256 \
+            -subj '/CN=Portfolio CI Health CA' \
+            -addext 'basicConstraints=critical,CA:TRUE' \
+            -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+            -keyout nginx/certs/ci-health-ca.key \
+            -out nginx/certs/ci-health-ca.pem >/dev/null 2>&1
+          openssl req -newkey rsa:2048 -nodes -sha256 \
+            -subj '/CN=beta-demo.top' \
+            -addext 'subjectAltName=DNS:beta-demo.top,DNS:www.beta-demo.top' \
+            -addext 'basicConstraints=critical,CA:FALSE' \
+            -addext 'keyUsage=critical,digitalSignature,keyEncipherment' \
+            -addext 'extendedKeyUsage=serverAuth' \
+            -keyout nginx/certs/beta-demo.top.key \
+            -out nginx/certs/beta-demo.top.csr >/dev/null 2>&1
+          openssl x509 -req -days 90 -sha256 \
+            -in nginx/certs/beta-demo.top.csr \
+            -CA nginx/certs/ci-health-ca.pem \
+            -CAkey nginx/certs/ci-health-ca.key \
+            -CAcreateserial \
+            -copy_extensions copy \
+            -out nginx/certs/beta-demo.top.pem >/dev/null 2>&1
+          rm -f -- \
+            nginx/certs/beta-demo.top.csr \
+            nginx/certs/ci-health-ca.key \
+            nginx/certs/ci-health-ca.srl
+      - name: Run deployment preflight against isolated fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          env_file="${RUNNER_TEMP}/portfolio-compose.env"
+          umask 077
+          printf '%s\n' \
+            "POSTGRES_USER=${POSTGRES_USER}" \
+            "POSTGRES_DB=${POSTGRES_DB}" \
+            "AUTH_COOKIE_SECURE=${AUTH_COOKIE_SECURE}" \
+            "PUBLIC_ORIGIN=${PUBLIC_ORIGIN}" \
+            "PORTFOLIO_POSTGRES_PASSWORD_SECRET_FILE=${PORTFOLIO_POSTGRES_PASSWORD_SECRET_FILE}" \
+            "PORTFOLIO_POSTGRES_APP_PASSWORD_SECRET_FILE=${PORTFOLIO_POSTGRES_APP_PASSWORD_SECRET_FILE}" \
+            "PORTFOLIO_ADMIN_PASSWORD_HASH_SECRET_FILE=${PORTFOLIO_ADMIN_PASSWORD_HASH_SECRET_FILE}" \
+            "PORTFOLIO_APP_SECRET_KEY_SECRET_FILE=${PORTFOLIO_APP_SECRET_KEY_SECRET_FILE}" \
+            "PORTFOLIO_AI_API_KEY_SECRET_FILE=${PORTFOLIO_AI_API_KEY_SECRET_FILE}" \
+            > "${env_file}"
+          chmod 0600 "${env_file}"
+          python3 scripts/deployment_preflight.py \
+            --repository "${GITHUB_WORKSPACE}" \
+            --env "${env_file}"
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+      - name: Build application images
+        run: docker compose build backend database-init frontend
+      - name: Start the isolated deployment
+        run: docker compose up --detach --wait --wait-timeout 180 postgres backend frontend nginx
+      - name: Validate Nginx and Alembic
+        run: |
+          docker compose exec -T nginx nginx -t
+          docker compose exec -T backend python - <<'PY'
+          from alembic.config import Config
+          from alembic.migration import MigrationContext
+          from alembic.script import ScriptDirectory
+
+          from app.db.session import engine
+
+          repository_heads = tuple(
+              ScriptDirectory.from_config(Config("/app/alembic.ini")).get_heads()
+          )
+          if len(repository_heads) != 1:
+              raise SystemExit(
+                  "Expected exactly one repository Alembic head; "
+                  f"found {repository_heads!r}"
+              )
+          with engine.connect() as connection:
+              database_heads = tuple(
+                  MigrationContext.configure(connection).get_current_heads()
+              )
+          if database_heads != repository_heads:
+              raise SystemExit(
+                  "Database Alembic revision does not match the repository head: "
+                  f"database={database_heads!r}, repository={repository_heads!r}"
+              )
+          print(f"Verified Alembic revision {repository_heads[0]}")
+          PY
+          docker compose run --rm --no-deps -T \
+            --env PYTHONPATH=/app \
+            --volume "${GITHUB_WORKSPACE}/scripts/tests/assert_runtime_role.py:/tmp/assert_runtime_role.py:ro" \
+            --entrypoint python backend /tmp/assert_runtime_role.py
+      - name: Initialize CMS through the administrator API
+        shell: bash
+        run: |
+          set -euo pipefail
+          api_fixture_dir="${RUNNER_TEMP}/portfolio-compose-api"
+          install -d -m 0700 "${api_fixture_dir}"
+          login_payload="${api_fixture_dir}/login.json"
+          cookie_jar="${api_fixture_dir}/cookies.txt"
+          initial_headers="${api_fixture_dir}/initial-headers.txt"
+          initial_state="${api_fixture_dir}/initial-state.json"
+          content_payload="${api_fixture_dir}/content.json"
+          save_response="${api_fixture_dir}/save-response.json"
+          public_content="${api_fixture_dir}/public-content.json"
+          umask 077
+
+          python3 - "${PORTFOLIO_ADMIN_PASSWORD_FILE}" "${login_payload}" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          password = Path(sys.argv[1]).read_text(encoding="utf-8")
+          destination = Path(sys.argv[2])
+          destination.write_text(
+              json.dumps({"password": password}),
+              encoding="utf-8",
+          )
+          os.chmod(destination, 0o600)
+          PY
+
+          PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONPATH="${GITHUB_WORKSPACE}/backend:${GITHUB_WORKSPACE}/backend/tests" \
+            python3 - "${content_payload}" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          from app.schemas.content import ContentPayload
+          from test_content_schema import valid_content
+
+          payload = valid_content()
+          post = payload["blogPosts"][0]
+          post.update({
+              "id": "micro-interactions",
+              "title": "微交互的艺术：如何在极简界面中用动效创造“触感”",
+              "slug": "micro-interactions",
+              "excerpt": "CI deployment smoke-test article",
+              "content": "# 微交互的艺术\n\nCI deployment smoke-test content.",
+              "status": "published",
+              "coverImage": None,
+          })
+          post.pop("scheduledAt", None)
+          validated = ContentPayload.model_validate(payload).model_dump(exclude_none=True)
+          destination = Path(sys.argv[1])
+          destination.write_text(
+              json.dumps(validated, ensure_ascii=False),
+              encoding="utf-8",
+          )
+          os.chmod(destination, 0o600)
+          PY
+
+          curl_args=(--fail --silent --show-error --cacert nginx/certs/ci-health-ca.pem --resolve beta-demo.top:443:127.0.0.1)
+          curl "${curl_args[@]}" \
+            --cookie-jar "${cookie_jar}" \
+            --header 'Origin: https://beta-demo.top' \
+            --header 'Content-Type: application/json' \
+            --data-binary "@${login_payload}" \
+            --output /dev/null \
+            https://beta-demo.top/backend/api/v1/admin/login
+
+          curl "${curl_args[@]}" \
+            --cookie "${cookie_jar}" \
+            --dump-header "${initial_headers}" \
+            --output "${initial_state}" \
+            https://beta-demo.top/backend/api/v1/admin/content
+          python3 - "${initial_state}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          state = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if state != {"initialized": False, "content": None}:
+              raise SystemExit(f"Expected an uninitialized CMS; received {state!r}")
+          PY
+          initial_etag="$(sed -n 's/^[Ee][Tt][Aa][Gg]:[[:space:]]*//p' "${initial_headers}" | tr -d '\r' | tail -n 1)"
+          test "${initial_etag}" = '"0"'
+
+          curl "${curl_args[@]}" \
+            --request PUT \
+            --cookie "${cookie_jar}" \
+            --header 'Origin: https://beta-demo.top' \
+            --header 'Content-Type: application/json' \
+            --header "If-Match: ${initial_etag}" \
+            --data-binary "@${content_payload}" \
+            --output "${save_response}" \
+            https://beta-demo.top/backend/api/v1/admin/content
+          python3 - "${save_response}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          response = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if response != {"saved": True}:
+              raise SystemExit(f"CMS initialization failed: {response!r}")
+          PY
+
+          curl "${curl_args[@]}" \
+            --output "${public_content}" \
+            https://beta-demo.top/backend/api/v1/content
+          python3 - "${public_content}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          content = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          posts = content.get("blogPosts")
+          if not isinstance(posts, list) or len(posts) != 1:
+              raise SystemExit(f"Expected exactly one published smoke-test post; received {posts!r}")
+          post = posts[0]
+          if post.get("id") != "micro-interactions" or post.get("status") != "published":
+              raise SystemExit(f"Unexpected public smoke-test post: {post!r}")
+          PY
+      - name: Run HTTPS smoke checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl_args=(--fail --silent --show-error --cacert nginx/certs/ci-health-ca.pem --resolve beta-demo.top:443:127.0.0.1)
+          curl "${curl_args[@]}" https://beta-demo.top/ >/dev/null
+          curl "${curl_args[@]}" https://beta-demo.top/admin >/dev/null
+          curl "${curl_args[@]}" https://beta-demo.top/backend/health/ready >/dev/null
+          article_html="${RUNNER_TEMP}/article.html"
+          curl "${curl_args[@]}" --output "${article_html}" https://beta-demo.top/blog/micro-interactions
+          grep -Fq '微交互的艺术' "${article_html}"
+          grep -Fq 'type="application/ld+json"' "${article_html}"
+          grep -Fq '<template id="portfolio-bootstrap">' "${article_html}"
+          test "$(curl --silent --cacert nginx/certs/ci-health-ca.pem --resolve beta-demo.top:443:127.0.0.1 --output /dev/null --write-out '%{http_code}' https://beta-demo.top/definitely-missing)" = "404"
+          test "$(curl --silent --cacert nginx/certs/ci-health-ca.pem --resolve beta-demo.top:443:127.0.0.1 --output /dev/null --write-out '%{http_code}' 'https://beta-demo.top/?post=micro-interactions')" = "308"
+          curl "${curl_args[@]}" https://beta-demo.top/sitemap.xml | grep -Fq '/blog/micro-interactions'
+          curl "${curl_args[@]}" https://beta-demo.top/rss.xml | grep -Fq '<rss version="2.0">'
+          headers_file="${RUNNER_TEMP}/admin-headers.txt"
+          curl "${curl_args[@]}" --dump-header "${headers_file}" --output /dev/null https://beta-demo.top/admin
+          grep -Fqi 'x-robots-tag: noindex' "${headers_file}"
+          grep -Fqi 'x-request-id:' "${headers_file}"
+          test "$(curl --silent --cacert nginx/certs/ci-health-ca.pem --resolve beta-demo.top:443:127.0.0.1 --output /dev/null --write-out '%{http_code}' https://beta-demo.top/server.cjs)" = "404"
+          test "$(curl --silent --cacert nginx/certs/ci-health-ca.pem --resolve beta-demo.top:443:127.0.0.1 --output /dev/null --write-out '%{http_code}' https://beta-demo.top/backend/docs)" = "404"
+          test "$(curl --silent --cacert nginx/certs/ci-health-ca.pem --resolve beta-demo.top:443:127.0.0.1 --header 'Origin: https://beta-demo.top' --header 'Content-Type: application/json' --data '{}' --output /dev/null --write-out '%{http_code}' https://beta-demo.top/backend/api/v1/admin/login)" = "422"
+      - name: Verify Nginx request-body boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl_args=(--silent --show-error --connect-timeout 2 --max-time 30 --cacert nginx/certs/ci-health-ca.pem --resolve beta-demo.top:443:127.0.0.1 --output /dev/null --write-out '%{http_code}')
+          small_limit_overflow="${RUNNER_TEMP}/nginx-small-limit-overflow.bin"
+          accepted_upload="${RUNNER_TEMP}/nginx-accepted-upload.bin"
+          rejected_upload="${RUNNER_TEMP}/nginx-rejected-upload.bin"
+          accepted_content="${RUNNER_TEMP}/nginx-accepted-content.bin"
+          rejected_content="${RUNNER_TEMP}/nginx-rejected-content.bin"
+          truncate -s 65537 "${small_limit_overflow}"
+          truncate -s 8M "${accepted_upload}"
+          truncate -s 9M "${rejected_upload}"
+          truncate -s 2M "${accepted_content}"
+          truncate -s 3145729 "${rejected_content}"
+
+          test "$(curl "${curl_args[@]}" --header 'Content-Type: application/json' --data-binary "@${small_limit_overflow}" https://beta-demo.top/api/agent/chat)" = "413"
+          test "$(curl "${curl_args[@]}" --header 'Origin: https://beta-demo.top' --header 'Content-Type: application/json' --data-binary "@${small_limit_overflow}" https://beta-demo.top/backend/api/v1/admin/logout)" = "413"
+          test "$(curl "${curl_args[@]}" --request PUT --header 'Origin: https://beta-demo.top' --header 'Content-Type: application/json' --data-binary "@${accepted_content}" https://beta-demo.top/backend/api/v1/admin/content)" = "422"
+          test "$(curl "${curl_args[@]}" --request PUT --header 'Origin: https://beta-demo.top' --header 'Content-Type: application/json' --data-binary "@${rejected_content}" https://beta-demo.top/backend/api/v1/admin/content)" = "413"
+          test "$(curl "${curl_args[@]}" --header 'Origin: https://beta-demo.top' --form "image=@${accepted_upload};type=image/png" https://beta-demo.top/backend/api/v1/admin/uploads)" = "401"
+          test "$(curl "${curl_args[@]}" --header 'Origin: https://beta-demo.top' --form "image=@${rejected_upload};type=image/png" https://beta-demo.top/backend/api/v1/admin/uploads)" = "413"
+          truncate -s 16385 "${small_limit_overflow}"
+          test "$(curl "${curl_args[@]}" --header 'Origin: https://beta-demo.top' --header 'Content-Type: application/json' --data-binary "@${small_limit_overflow}" https://beta-demo.top/backend/api/v1/admin/login)" = "413"
+      - name: Verify dynamic Docker DNS after frontend replacement
+        shell: bash
+        run: |
+          set -euo pipefail
+          nginx_id="$(docker compose ps -q nginx)"
+          docker compose up --detach --force-recreate --no-deps frontend
+          recovered=false
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --cacert nginx/certs/ci-health-ca.pem --resolve beta-demo.top:443:127.0.0.1 https://beta-demo.top/ >/dev/null; then
+              recovered=true
+              break
+            fi
+            sleep 2
+          done
+          test "${recovered}" = "true"
+          test "$(docker compose ps -q nginx)" = "${nginx_id}"
+      - name: Stop the smoke-test deployment
+        run: docker compose down --volumes --remove-orphans
+      - name: Run isolated recovery integration test
+        env:
+          PORTFOLIO_RUN_RECOVERY_INTEGRATION: "true"
+        run: scripts/tests/recovery-integration.sh
+      - name: Show service state after failure
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs --no-color --tail 100
+      - name: Tear down isolated deployment
+        if: always()
+        run: docker compose down --volumes --remove-orphans
+      - name: Remove temporary Compose credentials and TLS material
+        if: always()
+        shell: bash
+        run: |
+          rm -rf -- "${RUNNER_TEMP}/portfolio-compose-api"
+          rm -rf -- "${RUNNER_TEMP}/portfolio-compose-secrets"
+          rm -f -- "${RUNNER_TEMP}/portfolio-compose.env"
+          rm -f -- \
+            nginx/certs/beta-demo.top.csr \
+            nginx/certs/beta-demo.top.key \
+            nginx/certs/beta-demo.top.pem \
+            nginx/certs/ci-health-ca.key \
+            nginx/certs/ci-health-ca.pem \
+            nginx/certs/ci-health-ca.srl

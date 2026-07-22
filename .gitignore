@@ -1,0 +1,55 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python virtual environment
+.venv/
+backend/.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# PostgreSQL local data
+docker/postgresql/data/
+
+# Runtime uploads are kept in the Compose volume, never in the build tree
+backend/uploads/
+
+# Node.js
+node_modules/
+frontend/node_modules/
+
+# Independently versioned showcase projects
+/project/
+
+# Next.js
+frontend/.next/
+frontend/out/
+
+# Logs
+*.log
+logs/
+
+# Local database and media backups
+backups/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# SSL certificates
+nginx/certs/
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
