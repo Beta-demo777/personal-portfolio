@@ -18,7 +18,7 @@ Pillow==11.3.0
 psycopg2-binary==2.9.12
 pycparser==2.22
 pydantic==2.13.4
-pydantic-settings==2.11.0
+pydantic-settings==2.14.2
 pydantic_core==2.46.4
 python-dotenv==1.2.1
 python-multipart==0.0.20
